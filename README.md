@@ -1,6 +1,6 @@
 # GB BESS Market Analysis & Forecasting Tool 🔋
 
-A comprehensive Python toolkit for analyzing Great Britain's Battery Energy Storage System (BESS) markets, including historical trend analysis, price forecasting, and market insights.
+The goals for this project is the following: A comprehensive Python toolkit for analyzing Great Britain's Battery Energy Storage System (BESS) markets, including historical trend analysis, price forecasting, and market insights.
 
 ## 📋 Project Overview
 
