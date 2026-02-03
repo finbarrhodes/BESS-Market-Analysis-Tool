@@ -17,27 +17,21 @@ data_collection:
 # API Configuration
 apis:
   national_grid_eso:
-    base_url: "https://data.nationalgrideso.com"
-    # Key datasets to collect
+    # NESO Data Portal — CKAN datastore API (no key required)
+    base_url: "https://api.neso.energy/api/3/action"
     datasets:
       dynamic_containment: "dynamic-containment-data"
-      dynamic_regulation: "dynamic-regulation-data"
-      dynamic_moderation: "dynamic-moderation-data"
-      system_frequency: "system-frequency-data"
-      demand: "historic-demand-data"
-    rate_limit: 100  # requests per minute
-    
+      dynamic_regulation: "dynamic-regulation-requirements"
+      dynamic_moderation: "dynamic-moderation-requirements"
+    rate_limit: 2  # datastore limit: 2 requests per minute
+
   elexon:
-    base_url: "https://api.bmreports.com/BMRS"
-    # Get API key from: https://www.elexonportal.co.uk/
-    api_key_env: "ELEXON_API_KEY"
+    # Elexon Insights Solution API (no key required)
+    base_url: "https://data.elexon.co.uk/bmrs/api/v1"
     endpoints:
-      system_prices: "B1770"  # System Sell and Buy Prices
-      imbalance_prices: "B1780"  # Imbalance Prices
-      balancing_services: "B1440"  # Balancing Services Adjustment Data
-      frequency_response: "FREQ"  # System Frequency
-      generation_by_fuel: "B1620"  # Actual Generation Output
-      day_ahead_prices: "B1430"  # Day-Ahead Prices
+      system_prices: "/balancing/settlement/system-prices"
+      market_index: "/balancing/pricing/market-index"
+      generation_by_fuel: "/datasets/FUELHH"
     rate_limit: 60  # requests per minute
 
 # Market segments to analyze

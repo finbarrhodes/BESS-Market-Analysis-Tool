@@ -1,316 +1,244 @@
 """
 Elexon BMRS Data Collection Module
 
-Collects data from Elexon Balancing Mechanism Reporting Service including:
-- System Buy/Sell Prices
-- Imbalance Prices
-- Balancing Mechanism actions
-- Generation by fuel type
-- Day-ahead prices
+Collects data from the Elexon Insights Solution API (replacement for legacy BMRS).
+All endpoints are public and require no API key.
+
+API base: https://data.elexon.co.uk/bmrs/api/v1/
+
+Endpoints used:
+- /balancing/settlement/system-prices/{date}  (was B1770)
+- /balancing/pricing/market-index              (was B1780)
+- /datasets/FUELHH                             (was B1620)
 """
 
+import requests
 import pandas as pd
+import time
 from typing import Optional, Dict
 from loguru import logger
-from ElexonDataPortal import api
-
 
 from ..utils import (
     load_config,
     setup_logging,
     save_dataframe,
-    get_api_key
+    generate_date_range,
 )
+
+BASE_URL = "https://data.elexon.co.uk/bmrs/api/v1"
 
 
 class ElexonBMRSCollector:
-    """Collector for Elexon BMRS data using ElexonDataPortal package."""
+    """Collector for Elexon BMRS data via the Insights Solution REST API."""
 
     def __init__(self, config: Optional[Dict] = None):
-        """
-        Initialize the Elexon BMRS collector.
-
-        Args:
-            config: Configuration dictionary. If None, loads from config.yaml
-        """
         if config is None:
             config = load_config()
 
         self.config = config
-        self.api_config = config['apis']['elexon']
-
-        # Get API key from environment
-        try:
-            api_key = get_api_key('ELEXON')
-        except ValueError as e:
-            logger.error(f"API key not found: {e}")
-            raise ValueError("API key required for Elexon BMRS. Set ELEXON_API_KEY in .env file")
-
-        # Initialize ElexonDataPortal client
-        self.client = api.Client(api_key)
+        self.api_config = config["apis"]["elexon"]
+        self.rate_limit = self.api_config.get("rate_limit", 60)
+        self.last_request_time = 0
+        self.session = requests.Session()
 
         setup_logging(config)
-        logger.info("Elexon BMRS Collector initialized with ElexonDataPortal")
-    
-    def _process_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        logger.info("Elexon BMRS Collector initialized (Insights Solution API)")
+
+    # ------------------------------------------------------------------
+    # HTTP helpers
+    # ------------------------------------------------------------------
+
+    def _rate_limit_wait(self):
+        """Enforce rate limiting between requests."""
+        min_interval = 60 / self.rate_limit
+        elapsed = time.time() - self.last_request_time
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        self.last_request_time = time.time()
+
+    def _get(self, path: str, params: Optional[Dict] = None) -> Dict:
         """
-        Standardize column names and types across all data.
+        GET request against the Insights Solution API.
 
-        Args:
-            df: Raw DataFrame from API
-
-        Returns:
-            Processed DataFrame
+        Returns the parsed JSON response dict, or raises on HTTP errors.
         """
-        if df.empty:
-            return df
+        self._rate_limit_wait()
+        url = f"{BASE_URL}/{path.lstrip('/')}"
+        resp = self.session.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
 
-        # Standardize datetime columns
-        if 'settlementDate' in df.columns:
-            df['settlement_date'] = pd.to_datetime(df['settlementDate'])
-        if 'settlementPeriod' in df.columns:
-            df['settlement_period'] = pd.to_numeric(df['settlementPeriod'], errors='coerce').astype('Int64')
-
-        # Standardize price columns
-        price_columns = {
-            'systemSellPrice': 'system_sell_price',
-            'systemBuyPrice': 'system_buy_price',
-            'imbalancePrice': 'imbalance_price',
-            'imbalancePriceAmount': 'imbalance_price'
-        }
-
-        for old_col, new_col in price_columns.items():
-            if old_col in df.columns:
-                df[new_col] = pd.to_numeric(df[old_col], errors='coerce')
-
-        return df
+    # ------------------------------------------------------------------
+    # System Sell / Buy Prices  (was B1770)
+    # ------------------------------------------------------------------
 
     def collect_system_prices(
         self,
         start_date: str,
         end_date: str,
-        save: bool = True
+        save: bool = True,
     ) -> pd.DataFrame:
         """
-        Collect System Sell Price (SSP) and System Buy Price (SBP).
-        Report: B1770
+        Collect System Sell & Buy Prices for a date range.
 
-        Args:
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            save: Whether to save data to file
-
-        Returns:
-            DataFrame with system prices
+        The endpoint serves one settlement date at a time, so we iterate
+        over each day in the range.
         """
         logger.info(f"Collecting system prices from {start_date} to {end_date}")
+        frames = []
 
-        try:
-            # Use ElexonDataPortal to get system prices
-            # API uses start_date and end_date parameters
-            df = self.client.get_B1770(
-                start_date=start_date,
-                end_date=end_date
-            )
+        for day in generate_date_range(start_date, end_date, freq="D"):
+            date_str = day.strftime("%Y-%m-%d")
+            try:
+                data = self._get(f"/balancing/settlement/system-prices/{date_str}")
+                records = data.get("data", [])
+                if records:
+                    frames.append(pd.DataFrame(records))
+            except requests.RequestException as e:
+                logger.warning(f"Failed for {date_str}: {e}")
 
-            # Process DataFrame
-            df = self._process_dataframe(df)
+        # Filter out any empty frames before concat to avoid FutureWarning
+        frames = [f for f in frames if not f.empty]
+        if not frames:
+            logger.warning("No system price data retrieved")
+            return pd.DataFrame()
 
-            logger.info(f"Collected {len(df)} system price records")
+        df = pd.concat(frames, ignore_index=True)
+        df["settlementDate"] = pd.to_datetime(df["settlementDate"])
+        df["startTime"] = pd.to_datetime(df["startTime"])
+        logger.info(f"Collected {len(df)} system price records")
 
-            if save and not df.empty:
-                filename = f"system_prices_{start_date}_{end_date}"
-                save_dataframe(df, filename, data_type='raw', format='csv')
-
-        except Exception as e:
-            logger.error(f"Failed to collect system prices: {e}")
-            df = pd.DataFrame()
+        if save:
+            filename = f"system_prices_{start_date}_{end_date}"
+            save_dataframe(df, filename, data_type="raw", format="csv")
 
         return df
-    
+
+    # ------------------------------------------------------------------
+    # Market Index Prices  (was B1780)
+    # ------------------------------------------------------------------
+
     def collect_imbalance_prices(
         self,
         start_date: str,
         end_date: str,
-        save: bool = True
+        save: bool = True,
     ) -> pd.DataFrame:
         """
-        Collect imbalance prices (Market Index Price, Market Index Volume).
-        Report: B1780
+        Collect Market Index Price & Volume (imbalance proxy).
 
-        Args:
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            save: Whether to save data to file
-
-        Returns:
-            DataFrame with imbalance prices
+        This endpoint accepts from/to query params and returns all records
+        in a single response.
         """
-        logger.info(f"Collecting imbalance prices from {start_date} to {end_date}")
+        logger.info(f"Collecting market index prices from {start_date} to {end_date}")
 
         try:
-            df = self.client.get_B1780(
-                start_date=start_date,
-                end_date=end_date
+            data = self._get(
+                "/balancing/pricing/market-index",
+                params={"from": start_date, "to": end_date},
             )
+            records = data.get("data", [])
+            if not records:
+                logger.warning("No market index data returned")
+                return pd.DataFrame()
 
-            df = self._process_dataframe(df)
+            df = pd.DataFrame(records)
+            df["settlementDate"] = pd.to_datetime(df["settlementDate"])
+            df["startTime"] = pd.to_datetime(df["startTime"])
+            logger.info(f"Collected {len(df)} market index records")
 
-            logger.info(f"Collected {len(df)} imbalance price records")
+            if save:
+                filename = f"market_index_{start_date}_{end_date}"
+                save_dataframe(df, filename, data_type="raw", format="csv")
 
-            if save and not df.empty:
-                filename = f"imbalance_prices_{start_date}_{end_date}"
-                save_dataframe(df, filename, data_type='raw', format='csv')
+            return df
 
-        except Exception as e:
-            logger.error(f"Failed to collect imbalance prices: {e}")
-            df = pd.DataFrame()
+        except requests.RequestException as e:
+            logger.error(f"Failed to collect market index prices: {e}")
+            return pd.DataFrame()
 
-        return df
-    
+    # ------------------------------------------------------------------
+    # Generation by Fuel Type  (was B1620)
+    # ------------------------------------------------------------------
+
     def collect_generation_by_fuel(
         self,
         start_date: str,
         end_date: str,
-        save: bool = True
+        save: bool = True,
     ) -> pd.DataFrame:
         """
-        Collect actual generation output by fuel type.
-        Report: B1620
-
-        Args:
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            save: Whether to save data to file
-
-        Returns:
-            DataFrame with generation by fuel type
+        Collect half-hourly generation output by fuel type (FUELHH dataset).
         """
         logger.info(f"Collecting generation by fuel from {start_date} to {end_date}")
 
         try:
-            df = self.client.get_B1620(
-                start_date=start_date,
-                end_date=end_date
+            data = self._get(
+                "/datasets/FUELHH",
+                params={
+                    "settlementDateFrom": start_date,
+                    "settlementDateTo": end_date,
+                },
             )
+            records = data.get("data", [])
+            if not records:
+                logger.warning("No generation data returned")
+                return pd.DataFrame()
 
-            df = self._process_dataframe(df)
-
+            df = pd.DataFrame(records)
+            df["settlementDate"] = pd.to_datetime(df["settlementDate"])
+            df["startTime"] = pd.to_datetime(df["startTime"])
+            df["publishTime"] = pd.to_datetime(df["publishTime"])
             logger.info(f"Collected {len(df)} generation records")
 
-            if save and not df.empty:
+            if save:
                 filename = f"generation_by_fuel_{start_date}_{end_date}"
-                save_dataframe(df, filename, data_type='raw', format='csv')
+                save_dataframe(df, filename, data_type="raw", format="csv")
 
-        except Exception as e:
+            return df
+
+        except requests.RequestException as e:
             logger.error(f"Failed to collect generation data: {e}")
-            df = pd.DataFrame()
+            return pd.DataFrame()
 
-        return df
-    
-    def collect_day_ahead_prices(
-        self,
-        start_date: str,
-        end_date: str,
-        save: bool = True
-    ) -> pd.DataFrame:
-        """
-        Collect day-ahead market prices.
-        Report: B1430
+    # ------------------------------------------------------------------
+    # Convenience: collect everything
+    # ------------------------------------------------------------------
 
-        Args:
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            save: Whether to save data to file
-
-        Returns:
-            DataFrame with day-ahead prices
-        """
-        logger.info(f"Collecting day-ahead prices from {start_date} to {end_date}")
-
-        try:
-            df = self.client.get_B1430(
-                start_date=start_date,
-                end_date=end_date
-            )
-
-            df = self._process_dataframe(df)
-
-            logger.info(f"Collected {len(df)} day-ahead price records")
-
-            if save and not df.empty:
-                filename = f"day_ahead_prices_{start_date}_{end_date}"
-                save_dataframe(df, filename, data_type='raw', format='csv')
-
-        except Exception as e:
-            logger.error(f"Failed to collect day-ahead prices: {e}")
-            df = pd.DataFrame()
-
-        return df
-    
     def collect_all_markets(
         self,
         start_date: str,
         end_date: str,
-        save: bool = True
+        save: bool = True,
     ) -> Dict[str, pd.DataFrame]:
-        """
-        Collect data from all available BMRS reports.
-        
-        Args:
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            save: Whether to save data to files
-            
-        Returns:
-            Dictionary mapping report names to DataFrames
-        """
+        """Collect data from all available endpoints."""
         logger.info(f"Collecting all BMRS data from {start_date} to {end_date}")
-        
-        data = {}
-        
-        data['system_prices'] = self.collect_system_prices(
-            start_date, end_date, save
-        )
-        
-        data['imbalance_prices'] = self.collect_imbalance_prices(
-            start_date, end_date, save
-        )
-        
-        data['generation_by_fuel'] = self.collect_generation_by_fuel(
-            start_date, end_date, save
-        )
-        
-        data['day_ahead_prices'] = self.collect_day_ahead_prices(
-            start_date, end_date, save
-        )
-        
-        logger.info("Completed collecting all BMRS data")
-        
+
+        data = {
+            "system_prices": self.collect_system_prices(start_date, end_date, save),
+            "market_index": self.collect_imbalance_prices(start_date, end_date, save),
+            "generation_by_fuel": self.collect_generation_by_fuel(
+                start_date, end_date, save
+            ),
+        }
+
+        total = sum(len(df) for df in data.values())
+        logger.info(f"Completed BMRS collection — {total} total records")
         return data
 
 
-def main():
-    """Example usage of the Elexon BMRS collector."""
-    config = load_config()
-    
-    # Initialize collector
-    collector = ElexonBMRSCollector(config)
-    
-    # Collect data for a sample period
-    start_date = "2024-01-01"
-    end_date = "2024-01-07"
-    
-    # Collect all markets
-    data = collector.collect_all_markets(start_date, end_date, save=True)
-    
-    # Print summary
-    for market, df in data.items():
-        print(f"\n{market.upper()}")
-        print(f"Records: {len(df)}")
-        if not df.empty:
-            print(df.head())
-
+# ----------------------------------------------------------------------
+# Quick smoke-test when run directly
+# ----------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+    config = load_config()
+    collector = ElexonBMRSCollector(config)
+
+    start, end = "2024-01-01", "2024-01-02"
+    results = collector.collect_all_markets(start, end, save=False)
+
+    for name, df in results.items():
+        print(f"\n{name.upper()}: {len(df)} records")
+        if not df.empty:
+            print(df.head(3).to_string())

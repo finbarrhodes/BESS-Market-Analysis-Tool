@@ -1,368 +1,288 @@
 """
-National Grid ESO Data Collection Module
+National Energy System Operator (NESO) Data Collection Module
 
-Collects data from National Grid ESO Data Portal including:
-- Dynamic Containment (DC)
-- Dynamic Regulation (DR)
-- Dynamic Moderation (DM)
-- System Frequency
-- Demand Data
+Collects data from the NESO Data Portal, which exposes a CKAN-based API.
+
+CKAN (Comprehensive Knowledge Archive Network) is an open-source data
+catalogue platform.  NESO uses it to publish energy datasets.  The two
+main query mechanisms are:
+
+  1. ``datastore_search`` — filter/sort/paginate over a single resource.
+  2. ``datastore_search_sql`` — arbitrary SELECT queries (PostgreSQL
+     dialect) against one or more resources.
+
+We use SQL queries so that we can apply date-range filters server-side
+and only pull the rows we need.
+
+API base: https://api.neso.energy/api/3/action/
+
+Rate limits (from NESO guidance):
+  - CKAN metadata endpoints: max 1 req/s
+  - Datastore endpoints:     max 2 req/min
+
+Datasets used:
+  - DC/DR/DM Results Summary (resource 888e5029-...)
+  - DC Masterdata — per-unit bid detail (resource 0b8dbc3c-...)
+  - DR Requirements (resource d6c576b9-...)
+  - DM Requirements (resource 2aae8747-...)
 """
 
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List
-from pathlib import Path
 import time
+from typing import Optional, Dict
 from loguru import logger
 
 from ..utils import (
     load_config,
     setup_logging,
     save_dataframe,
-    parse_date,
-    generate_date_range
 )
 
+BASE_URL = "https://api.neso.energy/api/3/action"
 
-class NationalGridESOCollector:
-    """Collector for National Grid ESO data."""
-    
+# -----------------------------------------------------------------------
+# Resource IDs — these are the UUIDs of the CSV resources on the portal.
+# You can discover them yourself via:
+#   GET {BASE_URL}/package_show?id=dynamic-containment-data
+# -----------------------------------------------------------------------
+RESOURCE_IDS = {
+    # Auction clearing prices & volumes per service per EFA block
+    "results_summary": "888e5029-f786-41d2-bc15-cbfd1d285e96",
+    # Per-unit bid/offer detail (DC only, 2020–2021)
+    "dc_masterdata": "0b8dbc3c-e05e-44a4-b855-7dd1aa079c68",
+    # Indicative volume requirements published ahead of auctions
+    "dr_requirements": "d6c576b9-91d5-4c48-bf6d-300c7d7aa6ad",
+    "dm_requirements": "2aae8747-776d-4fe5-af9c-adcf38f1af8a",
+}
+
+
+class NESOCollector:
+    """Collector for NESO Data Portal via the CKAN datastore API."""
+
     def __init__(self, config: Optional[Dict] = None):
-        """
-        Initialize the ESO data collector.
-        
-        Args:
-            config: Configuration dictionary. If None, loads from config.yaml
-        """
         if config is None:
             config = load_config()
-        
+
         self.config = config
-        self.api_config = config['apis']['national_grid_eso']
-        self.base_url = self.api_config['base_url']
-        self.rate_limit = self.api_config['rate_limit']
+        self.api_config = config["apis"]["national_grid_eso"]
+        self.rate_limit = self.api_config.get("rate_limit", 2)  # datastore default
         self.last_request_time = 0
-        
+        self.session = requests.Session()
+
         setup_logging(config)
-        logger.info("National Grid ESO Collector initialized")
-    
+        logger.info("NESO Collector initialized (CKAN datastore API)")
+
+    # ------------------------------------------------------------------
+    # HTTP / rate-limit helpers
+    # ------------------------------------------------------------------
+
     def _rate_limit_wait(self):
-        """Implement rate limiting between requests."""
-        min_interval = 60 / self.rate_limit  # seconds between requests
+        """Respect the 2 req/min datastore rate limit."""
+        min_interval = 60 / self.rate_limit
         elapsed = time.time() - self.last_request_time
-        
         if elapsed < min_interval:
-            sleep_time = min_interval - elapsed
-            time.sleep(sleep_time)
-        
+            time.sleep(min_interval - elapsed)
         self.last_request_time = time.time()
-    
-    def _make_request(
-        self,
-        endpoint: str,
-        params: Optional[Dict] = None
-    ) -> Dict:
+
+    def _datastore_sql(self, sql: str) -> pd.DataFrame:
         """
-        Make HTTP request to ESO API with rate limiting.
-        
-        Args:
-            endpoint: API endpoint
-            params: Query parameters
-            
-        Returns:
-            JSON response as dictionary
+        Execute a read-only SQL query against the NESO datastore.
+
+        The CKAN ``datastore_search_sql`` action accepts a GET request
+        with the query in the ``sql`` query-parameter.  The response
+        JSON contains ``result.records`` (list of dicts) and
+        ``result.fields`` (column metadata).
         """
         self._rate_limit_wait()
-        
-        url = f"{self.base_url}/{endpoint}"
-        
-        try:
-            response = requests.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed: {e}")
-            raise
-    
-    def collect_dynamic_containment(
+        resp = self.session.get(
+            f"{BASE_URL}/datastore_search_sql",
+            params={"sql": sql},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+
+        if not body.get("success"):
+            error = body.get("error", {})
+            raise RuntimeError(f"CKAN SQL query failed: {error}")
+
+        records = body["result"]["records"]
+        if not records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+        # Drop the CKAN full-text-search column — it's internal noise
+        df = df.drop(columns=["_full_text"], errors="ignore")
+        return df
+
+    def _datastore_search(
+        self,
+        resource_id: str,
+        limit: int = 32000,
+        offset: int = 0,
+        sort: str = "_id asc",
+    ) -> pd.DataFrame:
+        """
+        Simple paginated fetch (no date filter).  Useful for small
+        reference tables like DR/DM requirements.
+        """
+        self._rate_limit_wait()
+        resp = self.session.get(
+            f"{BASE_URL}/datastore_search",
+            params={
+                "resource_id": resource_id,
+                "limit": limit,
+                "offset": offset,
+                "sort": sort,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+
+        if not body.get("success"):
+            raise RuntimeError(f"CKAN search failed: {body.get('error')}")
+
+        records = body["result"]["records"]
+        if not records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+        df = df.drop(columns=["_full_text"], errors="ignore")
+        return df
+
+    # ------------------------------------------------------------------
+    # DC / DR / DM auction results
+    # ------------------------------------------------------------------
+
+    def collect_auction_results(
         self,
         start_date: str,
         end_date: str,
-        save: bool = True
+        save: bool = True,
     ) -> pd.DataFrame:
         """
-        Collect Dynamic Containment auction results and prices.
-        
-        Args:
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            save: Whether to save data to file
-            
-        Returns:
-            DataFrame with DC auction data
+        Collect DC, DR & DM auction clearing prices and volumes.
+
+        Each row represents one service / EFA-block combination with
+        columns: Service, EFA Date, Delivery Start, Delivery End, EFA,
+        Cleared Volume, Clearing Price.
+
+        The dataset covers 2021-09 to 2023-11.
         """
-        logger.info(f"Collecting Dynamic Containment data from {start_date} to {end_date}")
-        
-        # Note: This is a placeholder structure
-        # Actual API endpoints and data structure will need to be verified
-        # from the National Grid ESO Data Portal
-        
-        endpoint = "dynamic-containment"
-        
-        params = {
-            'start_date': start_date,
-            'end_date': end_date,
-            'format': 'json'
-        }
-        
+        logger.info(
+            f"Collecting DC/DR/DM auction results from {start_date} to {end_date}"
+        )
+        resource = RESOURCE_IDS["results_summary"]
+        sql = (
+            f'SELECT * FROM "{resource}" '
+            f"WHERE \"EFA Date\" >= '{start_date}' "
+            f"AND \"EFA Date\" <= '{end_date}' "
+            f'ORDER BY "EFA Date" ASC, "EFA" ASC'
+        )
+
         try:
-            data = self._make_request(endpoint, params)
-            
-            # Parse response into DataFrame
-            # Structure will depend on actual API response
-            if 'records' in data:
-                df = pd.DataFrame(data['records'])
-            else:
-                df = pd.DataFrame(data)
-            
-            # Process timestamps
-            if 'delivery_start' in df.columns:
-                df['delivery_start'] = pd.to_datetime(df['delivery_start'])
-            if 'delivery_end' in df.columns:
-                df['delivery_end'] = pd.to_datetime(df['delivery_end'])
-            
-            logger.info(f"Collected {len(df)} Dynamic Containment records")
-            
+            df = self._datastore_sql(sql)
+
+            if df.empty:
+                logger.warning("No auction result records returned")
+                return df
+
+            df["EFA Date"] = pd.to_datetime(df["EFA Date"])
+            df["Delivery Start"] = pd.to_datetime(df["Delivery Start"])
+            df["Delivery End"] = pd.to_datetime(df["Delivery End"])
+            df["Clearing Price"] = pd.to_numeric(df["Clearing Price"], errors="coerce")
+            df["Cleared Volume"] = pd.to_numeric(
+                df["Cleared Volume"], errors="coerce"
+            )
+            logger.info(f"Collected {len(df)} auction result records")
+
             if save:
-                filename = f"dc_data_{start_date}_{end_date}"
-                save_dataframe(df, filename, data_type='raw', format='csv')
-            
+                filename = f"auction_results_{start_date}_{end_date}"
+                save_dataframe(df, filename, data_type="raw", format="csv")
+
             return df
-            
+
         except Exception as e:
-            logger.error(f"Failed to collect Dynamic Containment data: {e}")
+            logger.error(f"Failed to collect auction results: {e}")
             return pd.DataFrame()
-    
-    def collect_dynamic_regulation(
-        self,
-        start_date: str,
-        end_date: str,
-        save: bool = True
-    ) -> pd.DataFrame:
-        """
-        Collect Dynamic Regulation auction results and prices.
-        
-        Args:
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            save: Whether to save data to file
-            
-        Returns:
-            DataFrame with DR auction data
-        """
-        logger.info(f"Collecting Dynamic Regulation data from {start_date} to {end_date}")
-        
-        endpoint = "dynamic-regulation"
-        
-        params = {
-            'start_date': start_date,
-            'end_date': end_date,
-            'format': 'json'
-        }
-        
+
+    # ------------------------------------------------------------------
+    # DR / DM requirements (small reference tables)
+    # ------------------------------------------------------------------
+
+    def collect_dr_requirements(self, save: bool = True) -> pd.DataFrame:
+        """Collect indicative Dynamic Regulation volume requirements."""
+        logger.info("Collecting DR requirements")
         try:
-            data = self._make_request(endpoint, params)
-            
-            if 'records' in data:
-                df = pd.DataFrame(data['records'])
-            else:
-                df = pd.DataFrame(data)
-            
-            if 'delivery_start' in df.columns:
-                df['delivery_start'] = pd.to_datetime(df['delivery_start'])
-            if 'delivery_end' in df.columns:
-                df['delivery_end'] = pd.to_datetime(df['delivery_end'])
-            
-            logger.info(f"Collected {len(df)} Dynamic Regulation records")
-            
+            df = self._datastore_search(RESOURCE_IDS["dr_requirements"])
+            if df.empty:
+                logger.warning("No DR requirement records returned")
+                return df
+            df["EFA_DATE"] = pd.to_datetime(df["EFA_DATE"])
+            logger.info(f"Collected {len(df)} DR requirement records")
             if save:
-                filename = f"dr_data_{start_date}_{end_date}"
-                save_dataframe(df, filename, data_type='raw', format='csv')
-            
+                save_dataframe(df, "dr_requirements", data_type="raw", format="csv")
             return df
-            
         except Exception as e:
-            logger.error(f"Failed to collect Dynamic Regulation data: {e}")
+            logger.error(f"Failed to collect DR requirements: {e}")
             return pd.DataFrame()
-    
-    def collect_system_frequency(
-        self,
-        start_date: str,
-        end_date: str,
-        save: bool = True
-    ) -> pd.DataFrame:
-        """
-        Collect system frequency data.
-        
-        Args:
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            save: Whether to save data to file
-            
-        Returns:
-            DataFrame with frequency data
-        """
-        logger.info(f"Collecting system frequency data from {start_date} to {end_date}")
-        
-        endpoint = "system-frequency"
-        
-        params = {
-            'start_date': start_date,
-            'end_date': end_date,
-            'format': 'json'
-        }
-        
+
+    def collect_dm_requirements(self, save: bool = True) -> pd.DataFrame:
+        """Collect indicative Dynamic Moderation volume requirements."""
+        logger.info("Collecting DM requirements")
         try:
-            data = self._make_request(endpoint, params)
-            
-            if 'records' in data:
-                df = pd.DataFrame(data['records'])
-            else:
-                df = pd.DataFrame(data)
-            
-            if 'timestamp' in df.columns:
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-            
-            logger.info(f"Collected {len(df)} frequency records")
-            
+            df = self._datastore_search(RESOURCE_IDS["dm_requirements"])
+            if df.empty:
+                logger.warning("No DM requirement records returned")
+                return df
+            df["EFA_DATE"] = pd.to_datetime(df["EFA_DATE"])
+            logger.info(f"Collected {len(df)} DM requirement records")
             if save:
-                filename = f"frequency_data_{start_date}_{end_date}"
-                save_dataframe(df, filename, data_type='raw', format='csv')
-            
+                save_dataframe(df, "dm_requirements", data_type="raw", format="csv")
             return df
-            
         except Exception as e:
-            logger.error(f"Failed to collect frequency data: {e}")
+            logger.error(f"Failed to collect DM requirements: {e}")
             return pd.DataFrame()
-    
-    def collect_demand_data(
-        self,
-        start_date: str,
-        end_date: str,
-        save: bool = True
-    ) -> pd.DataFrame:
-        """
-        Collect historic demand data.
-        
-        Args:
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            save: Whether to save data to file
-            
-        Returns:
-            DataFrame with demand data
-        """
-        logger.info(f"Collecting demand data from {start_date} to {end_date}")
-        
-        endpoint = "demand"
-        
-        params = {
-            'start_date': start_date,
-            'end_date': end_date,
-            'format': 'json'
-        }
-        
-        try:
-            data = self._make_request(endpoint, params)
-            
-            if 'records' in data:
-                df = pd.DataFrame(data['records'])
-            else:
-                df = pd.DataFrame(data)
-            
-            if 'settlement_date' in df.columns:
-                df['settlement_date'] = pd.to_datetime(df['settlement_date'])
-            
-            logger.info(f"Collected {len(df)} demand records")
-            
-            if save:
-                filename = f"demand_data_{start_date}_{end_date}"
-                save_dataframe(df, filename, data_type='raw', format='csv')
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"Failed to collect demand data: {e}")
-            return pd.DataFrame()
-    
+
+    # ------------------------------------------------------------------
+    # Convenience: collect everything
+    # ------------------------------------------------------------------
+
     def collect_all_markets(
         self,
         start_date: str,
         end_date: str,
-        save: bool = True
+        save: bool = True,
     ) -> Dict[str, pd.DataFrame]:
-        """
-        Collect data from all available markets.
-        
-        Args:
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            save: Whether to save data to files
-            
-        Returns:
-            Dictionary mapping market names to DataFrames
-        """
-        logger.info(f"Collecting all market data from {start_date} to {end_date}")
-        
-        data = {}
-        
-        # Collect each market type
-        data['dynamic_containment'] = self.collect_dynamic_containment(
-            start_date, end_date, save
-        )
-        
-        data['dynamic_regulation'] = self.collect_dynamic_regulation(
-            start_date, end_date, save
-        )
-        
-        data['system_frequency'] = self.collect_system_frequency(
-            start_date, end_date, save
-        )
-        
-        data['demand'] = self.collect_demand_data(
-            start_date, end_date, save
-        )
-        
-        logger.info("Completed collecting all market data from National Grid ESO")
-        
+        """Collect all available NESO datasets."""
+        logger.info(f"Collecting all NESO data from {start_date} to {end_date}")
+
+        data = {
+            "auction_results": self.collect_auction_results(
+                start_date, end_date, save
+            ),
+            "dr_requirements": self.collect_dr_requirements(save),
+            "dm_requirements": self.collect_dm_requirements(save),
+        }
+
+        total = sum(len(df) for df in data.values())
+        logger.info(f"Completed NESO collection — {total} total records")
         return data
 
 
-def main():
-    """Example usage of the National Grid ESO collector."""
-    # Load configuration
-    config = load_config()
-    data_config = config['data_collection']
-    
-    # Initialize collector
-    collector = NationalGridESOCollector(config)
-    
-    # Collect data for a sample period
-    start_date = "2024-01-01"
-    end_date = "2024-01-07"
-    
-    # Collect all markets
-    data = collector.collect_all_markets(start_date, end_date, save=True)
-    
-    # Print summary
-    for market, df in data.items():
-        print(f"\n{market.upper()}")
-        print(f"Records: {len(df)}")
-        if not df.empty:
-            print(df.head())
-
+# ----------------------------------------------------------------------
+# Quick smoke-test when run directly
+# ----------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+    config = load_config()
+    collector = NESOCollector(config)
+
+    results = collector.collect_all_markets("2023-10-01", "2023-10-07", save=False)
+
+    for name, df in results.items():
+        print(f"\n{name.upper()}: {len(df)} records")
+        if not df.empty:
+            print(df.head(3).to_string())

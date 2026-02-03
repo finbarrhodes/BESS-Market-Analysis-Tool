@@ -17,7 +17,7 @@ import sys
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
-from src.data_collection import NationalGridESOCollector, ElexonBMRSCollector
+from src.data_collection import NESOCollector, ElexonBMRSCollector
 from src.utils import load_config, setup_logging
 from loguru import logger
 
@@ -81,18 +81,18 @@ def collect_neso_data(start_date: str, end_date: str, save: bool = True):
     logger.info("=" * 80)
     
     try:
-        collector = NationalGridESOCollector()
+        collector = NESOCollector()
         data = collector.collect_all_markets(start_date, end_date, save=save)
-        
+
         # Print summary
-        logger.info("\nNational Grid ESO Collection Summary:")
+        logger.info("\nNESO Collection Summary:")
         for market, df in data.items():
             logger.info(f"  {market}: {len(df)} records")
-        
+
         return data
-        
+
     except Exception as e:
-        logger.error(f"Failed to collect National Grid ESO data: {e}")
+        logger.error(f"Failed to collect NESO data: {e}")
         return {}
 
 
@@ -122,7 +122,7 @@ def collect_elexon_data(start_date: str, end_date: str, save: bool = True):
         
     except Exception as e:
         logger.error(f"Failed to collect Elexon BMRS data: {e}")
-        logger.error("Make sure ELEXON_API_KEY is set in your .env file")
+
         return {}
 
 
