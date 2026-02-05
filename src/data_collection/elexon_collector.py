@@ -274,3 +274,6 @@ if __name__ == "__main__":
         print(f"\n{name.upper()}: {len(df)} records")
         if not df.empty:
             print(df.head(3).to_string())
+
+# streamlit run src/visualization/dashboard.py
+
