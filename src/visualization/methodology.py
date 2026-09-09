@@ -458,6 +458,12 @@ st.markdown(
 | System buy/sell prices (SBP/SSP) | [Elexon Insights Solution API](https://developer.data.elexon.co.uk/) | Jul 2023 – present |
 | Generation by fuel type (daily) | [Elexon Insights Solution API](https://developer.data.elexon.co.uk/) | Jul 2023 – present |
 | GB BESS fleet capacity (monthly) | [DESNZ REPD](https://www.gov.uk/government/publications/renewable-energy-planning-database-monthly-extract) | 2019 – present (quarterly lag ~3 months) |
+
+**Overlapping pulls resolve to the most recent one.** Data is collected in date-ranged
+batches that overlap, and the trailing days of any batch are provisional — Elexon moves
+system prices through several settlement runs, and NESO revises embedded solar and wind
+after the fact. Where two batches cover the same settlement period and disagree, the batch
+collected later is kept, so a settled value always displaces the estimate it replaces.
 """
 )
 

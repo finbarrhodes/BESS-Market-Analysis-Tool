@@ -337,6 +337,12 @@ display(Inputs.table(rows, {rows: 6, width: {Dataset: 300, Source: 210}}));
 Coverage is read from the processed datasets at build time rather than hardcoded, so this
 table cannot drift out of date when the pipeline is re-run. Both NESO and Elexon APIs are
 fully public and require no key.
+
+<b>Overlapping pulls resolve to the most recent one.</b> Data is collected in date-ranged
+batches that overlap, and the trailing days of any batch are provisional — Elexon moves
+system prices through several settlement runs, and NESO revises embedded solar and wind
+after the fact. Where two batches cover the same settlement period and disagree, the batch
+collected later is kept, so a settled value always displaces the estimate it replaces.
 [NESO Data Portal](https://www.neso.energy/data-portal) ·
 [Elexon Insights](https://developer.data.elexon.co.uk/) ·
 [DESNZ REPD](https://www.gov.uk/government/publications/renewable-energy-planning-database-monthly-extract)

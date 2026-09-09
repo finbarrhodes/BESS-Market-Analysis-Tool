@@ -7,6 +7,11 @@ on:
       - 'data/cache/latest_kpis.json'
   pull_request:
   workflow_dispatch:
+  # The EAC freshness assertion in test_integration_apis.py is the tripwire for
+  # NESO's April resource rotation — the failure mode it guards is silent, and a
+  # push-triggered check only fires if something happens to be pushed. Weekly.
+  schedule:
+    - cron: '0 6 * * 1'
 
 jobs:
   unit:
@@ -34,10 +39,14 @@ jobs:
   contracts:
     name: Upstream API contracts
     runs-on: ubuntu-latest
-    # Live public APIs — informational, so an upstream outage doesn't block a push.
-    # A real failure here means NESO rotated its EAC resources (expected each
+    # Live public APIs — informational on a push, so an upstream outage doesn't
+    # block one. A real failure means NESO rotated its EAC resources (expected each
     # April) or Elexon changed date-parameter semantics; both need a code change.
-    continue-on-error: true
+    #
+    # The weekly run is the exception: it exists *to* catch that rotation, and a
+    # continue-on-error job reports the whole run green even when it fails, so the
+    # notification would never arrive. Scheduled runs fail loudly.
+    continue-on-error: ${{ github.event_name != 'schedule' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -51,4 +60,19 @@ jobs:
         run: pip install -r requirements.txt pytest
 
       - name: Run integration tests
+        id: contracts
         run: pytest -m integration -q
+
+      # A contract failure is expected and fine — these are live third-party APIs and
+      # the tests exist to catch upstream change. What is not fine is a bare red X that
+      # takes an hour to interpret, so name the two causes and where the fix goes. The
+      # assertion messages carry the specifics, including the exact _EAC_SEGMENTS line
+      # to paste after an April rotation.
+      - name: Explain the failure
+        if: failure() && steps.contracts.outcome == 'failure'
+        run: |
+          echo "::error title=Upstream data contract broke::Most likely one of two things."
+          echo "::error::1. NESO's April fiscal-year rotation — a new 'Results Summary FY<year> (Archive)' resource appeared. The test output prints the exact _EAC_SEGMENTS line to add in src/data_collection/neso_collector.py."
+          echo "::error::2. NESO renamed the EAC resources, which breaks the naming premise in _EAC_LIVE_RESOURCE_NAME / _EAC_ARCHIVE_NAME_RE. The test output lists every name currently published."
+          echo "::error::Either way collection returns SHORT rather than erroring, so fix this before the next scheduled refresh commits truncated data."
+          echo "::notice::An Elexon failure instead means date-parameter semantics changed — see test_elexon_to_parameter_is_exclusive_at_midnight."
