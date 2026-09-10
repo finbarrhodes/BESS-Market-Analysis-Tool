@@ -1,0 +1,182 @@
+name: Monthly Data Refresh
+
+# Extends the committed datasets and redeploys the site, without the runner ever
+# holding the ~450 MB of raw history.
+#
+# data/raw is gitignored, so a fresh checkout has none of it and re-collecting
+# from 2019 is impossible at NESO's 2 req/min. The committed parquets already
+# carry the whole history at roughly 100:1, so this resumes from them: collect a
+# recent slice into data/raw (which on a runner is pure scratch — nothing written
+# there can ever be committed), merge it with `prepare_data.py --append`, then
+# rebuild the cache from the extended parquets.
+#
+# Redeploying the site needs two things, and only one of them is obvious:
+#
+#   1. No [skip ci] on the commit. The old refresh_kpis.yml used it; copying that
+#      would suppress the redeploy outright.
+#   2. An explicit dispatch of deploy_site.yml at the end. A push authenticated
+#      with the default GITHUB_TOKEN does NOT trigger other workflows — GitHub
+#      suppresses it to prevent recursion — so deploy_site.yml's push trigger will
+#      never see this commit however the message is written. workflow_dispatch is
+#      one of the two events exempt from that rule, which is why the last step
+#      calls it directly. The alternative is pushing with a PAT instead; that
+#      would restore the push trigger at the cost of a secret to own and rotate.
+
+on:
+  schedule:
+    # 04:00 UTC on the 2nd of each month. Monthly rather than weekly because each
+    # refresh commits ~6.8 MB of parquet that git cannot delta-compress: monthly is
+    # ~80 MB/yr of history growth against ~350 MB/yr weekly, and GB market data does
+    # not move fast enough to justify the difference. The 2nd, not the 1st, so
+    # month-end settlement has a day to settle.
+    - cron: '0 4 2 * *'
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 'Days of history to re-pull (default 60)'
+        required: false
+        default: '60'
+
+permissions:
+  contents: write
+  # Needed for the final `gh workflow run` — dispatching deploy_site.yml is the
+  # only way this commit reaches the site, see the note above.
+  actions: write
+
+# Never let two refreshes interleave — they would race on the same commit. Unlike
+# the deploy workflow this does not cancel in flight: a run killed midway through
+# precompute_cache.py wastes ten minutes for nothing.
+concurrency:
+  group: data-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: Collect, extend, rebuild cache
+    runs-on: ubuntu-latest
+    # precompute_cache.py measured ~30 min locally (2026-09-09), and a hosted runner
+    # is typically slower than a dev machine at single-threaded numeric work. The
+    # backtest also lengthens every refresh, because DEFAULT_TEST_START is fixed and
+    # new data accrues to the test period. 60 was too tight on both counts.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # A 60-day window rather than "everything after the parquet's last date"
+      # because upstream revises: Elexon moves system prices through several
+      # settlement runs and NESO restates embedded solar and wind. Re-pulling the
+      # trailing window lets those corrections land. prepare_data.py --append is
+      # idempotent, so the overlap costs request time and nothing else.
+      #
+      # The window ends yesterday. Today is still settling, and a partial day would
+      # be written as a whole-day generation total.
+      - name: Compute collection window
+        id: window
+        run: |
+          LOOKBACK="${{ github.event.inputs.lookback_days || '60' }}"
+          echo "start=$(date -u -d "$LOOKBACK days ago" +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "end=$(date -u -d 'yesterday' +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Collect recent data
+        run: |
+          python src/data_collection/collect_data.py \
+            --start "${{ steps.window.outputs.start }}" \
+            --end   "${{ steps.window.outputs.end }}"
+
+      - name: Merge into the committed parquets
+        run: python scripts/prepare_data.py --append
+
+      # collect_data.py logs and swallows per-source failures, so an upstream outage
+      # leaves the parquets untouched, the cache rebuild reproduces identical numbers,
+      # and the commit step finds nothing to commit — a green run that did nothing.
+      # That silent-success mode is exactly how this project lost two years of data
+      # before, so assert the merge actually moved the frontier forward.
+      - name: Verify the data actually advanced
+        run: |
+          python - <<'PY'
+          import sys
+          import pandas as pd
+          from pathlib import Path
+
+          END = pd.Timestamp("${{ steps.window.outputs.end }}").date()
+          # Elexon publishes on a short lag and settlement runs trail further, so the
+          # frontier is allowed to sit a few days behind the requested end date.
+          TOLERANCE_DAYS = 5
+
+          stale = []
+          for name, col in [
+              ("market_index.parquet", "settlementDate"),
+              ("system_prices.parquet", "settlementDate"),
+              ("generation_daily.parquet", "settlementDate"),
+          ]:
+              hi = pd.read_parquet(Path("data/processed") / name)[col].max()
+              lag = (END - pd.Timestamp(hi).date()).days
+              print(f"{name}: latest {pd.Timestamp(hi).date()} ({lag} days behind {END})")
+              if lag > TOLERANCE_DAYS:
+                  stale.append(f"{name} is {lag} days behind the requested end date")
+
+          if stale:
+              print("::error title=Refresh collected nothing usable::" + "; ".join(stale))
+              print("::error::Check the collect step's logs for swallowed API failures. "
+                    "Nothing has been committed.")
+              sys.exit(1)
+          PY
+
+      # REPD is a quarterly Excel drop with no API, so this workflow cannot refresh
+      # it — the fleet series keeps its measured months and its projected tail widens
+      # by one every month until an extract is downloaded by hand. Warns rather than
+      # fails: a stale planning database is no reason to block a market data refresh.
+      - name: Check the REPD fleet series has not drifted
+        run: python scripts/check_repd_freshness.py
+
+      # The long pole: three MPC backtests, ~30 min and growing. See the note on
+      # timeout-minutes above.
+      - name: Rebuild the backtest cache
+        run: python scripts/precompute_cache.py
+
+      # Folded in from the retired refresh_kpis.yml. KPIs are derived from the
+      # processed parquets, so they belong here — where the data actually changes —
+      # rather than on their own cron, which only ever produced no-op commits.
+      - name: Recompute market KPIs
+        run: python scripts/compute_kpis.py
+
+      # The gate, and it runs BEFORE anything is staged: on failure the job aborts
+      # with the working tree uncommitted, so a torn cache is discarded with the
+      # runner rather than published. precompute_cache.py writes the three strategy
+      # parquets sequentially and the manifest last, so a half-written set is
+      # plausible-looking but internally inconsistent.
+      - name: Guard against a torn cache
+        run: python scripts/check_cache_consistency.py
+
+      - name: Commit and push
+        id: commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/processed data/cache
+          if git diff --cached --quiet; then
+            echo "Nothing changed — skipping commit."
+            exit 0
+          fi
+          # No [skip ci] — it would suppress CI on the commit, and the dispatch
+          # below is what actually reaches the site.
+          git commit -m "chore: monthly data refresh through ${{ steps.window.outputs.end }}"
+          git push
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      # A GITHUB_TOKEN push raises no push event, so deploy_site.yml has to be asked
+      # directly. Skipped when nothing was committed — there would be nothing to publish.
+      - name: Trigger the site deploy
+        if: steps.commit.outputs.pushed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run deploy_site.yml --ref main
