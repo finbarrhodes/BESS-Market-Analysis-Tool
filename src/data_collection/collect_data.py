@@ -45,8 +45,12 @@ def parse_arguments():
     parser.add_argument(
         '--config',
         type=str,
-        help='Path to config file',
-        default='config.yaml'
+        # None, not 'config.yaml': load_config already falls back to
+        # PROJECT_ROOT / "config.yaml", which resolves from the module location
+        # rather than the caller's cwd. A relative default meant the script only
+        # ran from the repo root.
+        help='Path to config file (default: config.yaml at the project root)',
+        default=None
     )
     
     parser.add_argument(

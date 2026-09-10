@@ -27,6 +27,7 @@ Datasets used:
   - DM Requirements (resource 2aae8747-...)
 """
 
+import re
 import requests
 import pandas as pd
 import time
@@ -61,10 +62,25 @@ RESOURCE_IDS = {
 # is therefore by segment; a single archive/current boundary goes stale on the
 # next rotation and silently returns short.
 #
-# Re-discover the IDs after each April rotation with:
-#   GET {BASE_URL}/package_search?q=enduring+auction+capability
-# looking for "NESO Response-Reserve Results Summary FY<year> (Archive)".
+# The rotation works by *addition*, not mutation: each April a brand-new
+# "... FY<year> (Archive)" resource appears holding the year that just ended, and
+# the live resource keeps its id while being truncated to the new year. So the
+# annual edit is two lines — repoint the outgoing segment at the new archive id
+# and close its end date, then open a new live segment on _EAC_LIVE_RESOURCE_ID.
 #
+# The three constants below are the naming premise the whole scheme rests on, and
+# test_eac_naming_convention_is_unchanged asserts them against the live portal —
+# so a rename by NESO fails with the reason named rather than silently returning
+# short. Keep them in sync with any future dynamic discovery.
+_EAC_PACKAGE_ID = "eac-auction-results"
+# Exact name of the live resource. Must be an equality test, not a substring one:
+# "NESO Response-Reserve Daily Results Summary" is a different, daily-granularity
+# resource that a loose match would happily pick up.
+_EAC_LIVE_RESOURCE_NAME = "NESO Response-Reserve Results Summary"
+_EAC_ARCHIVE_NAME_RE = re.compile(
+    r"^NESO Response-Reserve Results Summary FY(\d{4}) \(Archive\)$"
+)
+
 # (resource_id, first deliveryStart, last deliveryStart); None = to present.
 # Adjacent segments overlap by a day — duplicates are dropped on load.
 _EAC_SEGMENTS = [

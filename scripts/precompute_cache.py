@@ -12,7 +12,14 @@ Usage:
     python scripts/precompute_cache.py
 
 Re-run after any data update or methodology change, then commit the updated
-cache files.  Runtime: ~6–10 minutes total (three MPC backtests).
+cache files.  Runtime: ~30 minutes total, roughly 10 per strategy (measured
+2026-09-09 on a test window running to 2026-09-08).
+
+That figure grows over time and is worth re-checking. DEFAULT_TEST_START is held
+fixed across refreshes so new data accrues to the test period, which means each
+refresh lengthens the backtest and the runtime with it, close to linearly. The
+refresh workflow's timeout-minutes is set with headroom for that, but not
+infinite headroom.
 
 Strategies computed:
   1. Perfect Foresight + MPC  — revenue ceiling

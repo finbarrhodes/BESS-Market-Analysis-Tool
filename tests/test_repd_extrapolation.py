@@ -75,3 +75,48 @@ def test_no_projection_when_range_ends_at_measured_data():
 def test_capacity_never_negative():
     s = _series(n_months=30, end="2026-06-01")
     assert (s["bess_fleet_mw"] >= 0).all()
+
+
+# ---------------------------------------------------------------------------
+# Projected-tail freshness check (scripts/check_repd_freshness.py)
+# ---------------------------------------------------------------------------
+
+from scripts.check_repd_freshness import trailing_extrapolated_months
+
+
+def _flagged(flags):
+    """Fleet series with the given is_extrapolated flags, oldest first."""
+    return pd.DataFrame({
+        "month": pd.date_range("2026-01-01", periods=len(flags), freq="MS"),
+        "bess_fleet_mw": [100.0 * (i + 1) for i in range(len(flags))],
+        "is_extrapolated": flags,
+    })
+
+
+def test_trailing_run_is_counted_not_the_total():
+    """Only the tail reflects a missed REPD drop; a mid-series flag does not."""
+    assert trailing_extrapolated_months(_flagged([True, False, False, True, True])) == 2
+
+
+def test_no_projected_tail_counts_zero():
+    assert trailing_extrapolated_months(_flagged([False, False, False])) == 0
+
+
+def test_a_fully_projected_series_counts_every_month():
+    assert trailing_extrapolated_months(_flagged([True, True, True, True])) == 4
+
+
+def test_order_is_by_month_not_row_order():
+    """A shuffled frame must still count the chronological tail."""
+    df = _flagged([False, False, True, True]).sample(frac=1, random_state=0)
+    assert trailing_extrapolated_months(df) == 2
+
+
+def test_missing_flag_column_is_treated_as_no_projection():
+    """prepare_data.py omits the column for extracts predating the flag."""
+    df = _flagged([True, True]).drop(columns=["is_extrapolated"])
+    assert trailing_extrapolated_months(df) == 0
+
+
+def test_empty_series_does_not_raise():
+    assert trailing_extrapolated_months(_flagged([])) == 0
